@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-display: "Space Grotesk", sans-serif;
+  --font-body: "Inter", sans-serif;
+}
+
+body {
+  @apply bg-ink text-white font-body;
+  background-image: radial-gradient(circle at 20% -10%, rgba(139, 92, 246, 0.18), transparent 40%),
+    radial-gradient(circle at 90% 10%, rgba(34, 211, 238, 0.12), transparent 35%);
+  background-attachment: fixed;
+}
+
+.glass {
+  @apply bg-panel/70 backdrop-blur-xl border border-line rounded-2xl;
+}
+
+.aurora-text {
+  @apply bg-aurora bg-clip-text text-transparent;
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center rounded-full px-6 py-3 font-semibold text-white bg-aurora
+    shadow-[0_0_30px_-8px_rgba(139,92,246,0.7)] transition-transform duration-200 hover:scale-[1.03] active:scale-[0.98]
+    disabled:opacity-40 disabled:pointer-events-none;
+}
+
+.btn-secondary {
+  @apply inline-flex items-center justify-center rounded-full px-6 py-3 font-semibold text-white
+    border border-line bg-panel/60 transition-colors duration-200 hover:border-signal/60;
+}
+
+::selection {
+  background: rgba(139, 92, 246, 0.4);
+}
