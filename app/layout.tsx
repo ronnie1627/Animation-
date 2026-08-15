@@ -2,6 +2,13 @@ import type { Metadata } from "next";
 import "./globals.css";
 import Navbar from "@/components/Navbar";
 
+// The Navbar (and most pages) create a Supabase client and fetch data
+// client-side after mount, so there's no benefit to static prerendering —
+// and prerendering was causing build failures since env vars aren't
+// guaranteed to be available during that build-time phase. Forcing dynamic
+// rendering means pages render per-request instead, which works reliably.
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   title: "AnimeForge — Turn your story into anime",
   description: "Write a script, pick a style, get a narrated anime-style video in under a minute."
