@@ -46,11 +46,20 @@ async function generateSceneImage(
   const prompt = `${styleName} anime style illustration: ${description}, high quality, detailed, vibrant colors`;
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
 
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Pollinations image generation error (${res.status})`);
+  // A hard per-image timeout so one slow/stuck request can't silently hang
+  // the whole function past Supabase's execution limit.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000);
+
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`Pollinations image generation error (${res.status})`);
+    }
+    return new Uint8Array(await res.arrayBuffer());
+  } finally {
+    clearTimeout(timeout);
   }
-  return new Uint8Array(await res.arrayBuffer());
 }
 
 Deno.serve(async (req) => {
@@ -82,24 +91,28 @@ Deno.serve(async (req) => {
     const seed = seedFromProjectId(project_id);
     const { width, height } = dimensionsForAspectRatio(project.aspect_ratio);
 
-    const scenesWithVisuals = [];
-    let firstImageUrl: string | null = null;
+    // Generate every scene's image concurrently rather than one at a time —
+    // generating 5-9 images sequentially can exceed the edge function's
+    // execution time limit and get silently killed. Uploads still happen
+    // per-scene right after each image finishes.
+    const scenesWithVisuals = await Promise.all(
+      scenes.map(async (scene: any) => {
+        const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height);
 
-    for (const scene of scenes) {
-      const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height);
+        const path = `${job_id}/scene-${scene.index}.jpg`;
+        const { error: uploadError } = await admin.storage
+          .from("thumbnails")
+          .upload(path, imageBytes, { contentType: "image/jpeg", upsert: true });
 
-      const path = `${job_id}/scene-${scene.index}.jpg`;
-      const { error: uploadError } = await admin.storage
-        .from("thumbnails")
-        .upload(path, imageBytes, { contentType: "image/jpeg", upsert: true });
+        if (uploadError) throw new Error(`Image upload failed: ${uploadError.message}`);
 
-      if (uploadError) throw new Error(`Image upload failed: ${uploadError.message}`);
+        const { data: publicUrlData } = admin.storage.from("thumbnails").getPublicUrl(path);
+        return { ...scene, visual_url: publicUrlData.publicUrl };
+      })
+    );
 
-      const { data: publicUrlData } = admin.storage.from("thumbnails").getPublicUrl(path);
-      if (!firstImageUrl) firstImageUrl = publicUrlData.publicUrl;
-
-      scenesWithVisuals.push({ ...scene, visual_url: publicUrlData.publicUrl });
-    }
+    const firstImageUrl =
+      scenesWithVisuals.find((s) => s.index === 0)?.visual_url ?? scenesWithVisuals[0]?.visual_url ?? null;
 
     await admin
       .from("generation_jobs")
