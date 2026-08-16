@@ -48,15 +48,15 @@ async function generateSceneImage(
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000);
+  const timeout = setTimeout(() => controller.abort(), 20000);
 
   try {
     const res = await fetch(url, { signal: controller.signal });
 
-    if (res.status === 429 && attempt <= 3) {
-      // Pollinations rate-limits bursts of concurrent requests from the same
-      // source — back off and retry rather than failing the whole job.
-      await new Promise((resolve) => setTimeout(resolve, attempt * 4000));
+    if (res.status === 429 && attempt <= 2) {
+      // Pollinations rate-limits bursts of requests from the same source —
+      // back off briefly and retry rather than failing the whole job.
+      await new Promise((resolve) => setTimeout(resolve, attempt * 2500));
       return generateSceneImage(description, styleName, seed, width, height, attempt + 1);
     }
 
@@ -120,10 +120,13 @@ Deno.serve(async (req) => {
     const seed = seedFromProjectId(project_id);
     const { width, height } = dimensionsForAspectRatio(project.aspect_ratio);
 
-    // Generate scene images with limited concurrency (2 at a time) —
-    // fully parallel triggers Pollinations' burst rate limit, while fully
-    // sequential risks exceeding the edge function's execution time limit.
-    const scenesWithVisuals = await mapWithConcurrencyLimit(scenes, 2, async (scene: any) => {
+    // Generate scene images strictly one at a time. Supabase's free tier
+    // gives each edge function a hard 150-second wall-clock limit — even
+    // 2-at-a-time concurrency triggered Pollinations' burst rate limiter in
+    // testing, so this trades a little speed for reliability. Combined with
+    // the reduced 4-6 scene target from the script-breakdown step, this
+    // comfortably fits the time budget.
+    const scenesWithVisuals = await mapWithConcurrencyLimit(scenes, 1, async (scene: any) => {
       const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height);
 
       const path = `${job_id}/scene-${scene.index}.jpg`;
