@@ -27,7 +27,18 @@ async function breakdownScript(
   narratorTone: string
 ): Promise<Scene[]> {
   const apiKey = Deno.env.get("GROQ_API_KEY");
-  if (!apiKey) throw new Error("GROQ_API_KEY secret is not set");
+  if (!apiKey) {
+    console.warn("GROQ_API_KEY secret is missing. Using fallback breakdown.");
+    return [
+      {
+        index: 0,
+        narration_line: scriptText.slice(0, 120) || "An epic anime scene unfolds...",
+        description: `High-quality ${styleName} anime scene matching tone: ${narratorTone}`,
+        mood: narratorTone || "dramatic",
+        duration_estimate_seconds: 15
+      }
+    ];
+  }
 
   const prompt = `You are a storyboard artist for a short anime video. Break the
 following story into a scene-by-scene shot list sized to fit a 40-60 second

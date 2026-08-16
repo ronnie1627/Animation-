@@ -12,14 +12,26 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
 Deno.serve(async (req) => {
-  try {
-    const { job_id, project_id } = await req.json();
-    const admin = createClient(
-      Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("PROJECT_SERVICE_ROLE_KEY")!
-    );
+  // Parse the body once, outside the try block, so job_id is available to
+  // the catch block too — request bodies can only be read once, so trying
+  // to re-read it inside catch (as a previous version of this file did)
+  // silently fails and leaves the job stuck instead of marked as failed.
+  const { job_id, project_id } = await req.json();
 
-    const { data: project } = await admin.from("projects").select("*").eq("id", project_id).single();
+  const admin = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("PROJECT_SERVICE_ROLE_KEY")!
+  );
+
+  try {
+    const { data: project, error: projectError } = await admin
+      .from("projects")
+      .select("*")
+      .eq("id", project_id)
+      .single();
+
+    if (projectError) throw projectError;
+    if (!project) throw new Error("Project not found");
 
     // TODO: replace with the real composited video URL from your render service
     const placeholderVideoUrl = null;
@@ -34,7 +46,10 @@ Deno.serve(async (req) => {
       .eq("id", job_id);
 
     if (project.resolution === "4k") {
-      await admin.functions.invoke("upscale-to-4k", { body: { job_id, project_id } });
+      const { error: invokeError } = await admin.functions.invoke("upscale-to-4k", {
+        body: { job_id, project_id }
+      });
+      if (invokeError) throw invokeError;
     } else {
       await admin
         .from("generation_jobs")
@@ -42,20 +57,21 @@ Deno.serve(async (req) => {
         .eq("id", job_id);
     }
 
-    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+    return new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    });
   } catch (err) {
     console.error(err);
-    const body = await req.clone().json().catch(() => ({}));
-    if (body.job_id) {
-      const admin = createClient(
-        Deno.env.get("SUPABASE_URL")!,
-        Deno.env.get("PROJECT_SERVICE_ROLE_KEY")!
-      );
-      await admin
-        .from("generation_jobs")
-        .update({ status: "failed", error_message: (err as Error).message })
-        .eq("id", body.job_id);
-    }
+    await admin
+      .from("generation_jobs")
+      .update({
+        status: "failed",
+        error_message: `Compositing failed: ${(err as Error).message}`,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", job_id);
+
     return new Response(JSON.stringify({ error: (err as Error).message }), { status: 500 });
   }
 });

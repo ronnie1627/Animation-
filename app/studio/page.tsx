@@ -292,23 +292,34 @@ export default function StudioPage() {
               <ProgressPanel job={job} />
               {job.status === "complete" && (
                 <div className="glass p-4 space-y-3">
-                  <video
-                    src={job.video_url_4k || job.video_url_1080p || undefined}
-                    controls
-                    className="w-full rounded-lg"
-                  />
-                  <div className="flex gap-2">
-                    {job.video_url_1080p && (
-                      <a href={job.video_url_1080p} download className="btn-secondary flex-1 text-sm">
-                        Download 1080p
-                      </a>
-                    )}
-                    {job.video_url_4k && (
-                      <a href={job.video_url_4k} download className="btn-primary flex-1 text-sm">
-                        Download 4K
-                      </a>
-                    )}
-                  </div>
+                  {job.video_url_4k || job.video_url_1080p ? (
+                    <>
+                      <video
+                        src={job.video_url_4k || job.video_url_1080p || undefined}
+                        controls
+                        className="w-full rounded-lg"
+                      />
+                      <div className="flex gap-2">
+                        {job.video_url_1080p && (
+                          <a href={job.video_url_1080p} download className="btn-secondary flex-1 text-sm text-center">
+                            Download 1080p
+                          </a>
+                        )}
+                        {job.video_url_4k && (
+                          <a href={job.video_url_4k} download className="btn-primary flex-1 text-sm text-center">
+                            Download 4K
+                          </a>
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="p-4 text-center space-y-2">
+                      <p className="font-semibold text-amber-400 text-sm">Generation Completed (No Video URL)</p>
+                      <p className="text-xs text-mist">
+                        The pipeline completed, but no video file URL was set. Ensure your backend Edge Functions return a valid video output.
+                      </p>
+                    </div>
+                  )}
                 </div>
               )}
             </section>
