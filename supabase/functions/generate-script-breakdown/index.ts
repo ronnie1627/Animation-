@@ -7,7 +7,10 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+// Uses Google's "latest" alias rather than a pinned version string, since
+// Gemini's specific Flash model names have been renamed/deprecated
+// frequently — this alias auto-points to the current stable Flash model.
+const GEMINI_MODEL = "gemini-flash-latest";
 
 type Scene = {
   index: number;
