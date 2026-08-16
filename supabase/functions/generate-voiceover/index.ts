@@ -13,18 +13,39 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
-// Well-known ElevenLabs premade voice IDs, picked by the gender of the
-// voice the user selected in the Studio. These are public, standard
-// premade voices available on every ElevenLabs account.
-const VOICE_ID_BY_GENDER: Record<string, string> = {
-  female: "21m00Tcm4TlvDq8ikWAM", // Rachel
-  male: "TxGEqnHWrfWFTfGW9XjX", // Josh
-  neutral: "EXAVITQu4vr4xnSDxMaL" // Bella
-};
+// ElevenLabs blocked free-tier API access to shared Voice Library voices, so
+// hardcoded public voice IDs no longer work. Instead, we look up voices the
+// account owner has personally added to "My Voices" (elevenlabs.io/app/voice-library
+// → Add to My Voices), and pick one matching the requested gender, falling
+// back to the first available voice.
+async function getVoiceId(desiredGender: string, apiKey: string): Promise<string> {
+  const res = await fetch("https://api.elevenlabs.io/v1/voices", {
+    headers: { "xi-api-key": apiKey }
+  });
 
-async function synthesizeSpeech(text: string, voiceGender: string, apiKey: string): Promise<Uint8Array> {
-  const voiceId = VOICE_ID_BY_GENDER[voiceGender] || VOICE_ID_BY_GENDER.neutral;
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`ElevenLabs voices lookup error (${res.status}): ${errText}`);
+  }
 
+  const data = await res.json();
+  const voices = data?.voices ?? [];
+
+  if (voices.length === 0) {
+    throw new Error(
+      "No voices found on this ElevenLabs account. Add at least one voice at " +
+        "elevenlabs.io/app/voice-library (click a voice → Add to My Voices) before generating."
+    );
+  }
+
+  const genderMatch = voices.find(
+    (v: any) => (v.labels?.gender || "").toLowerCase() === desiredGender.toLowerCase()
+  );
+
+  return (genderMatch || voices[0]).voice_id;
+}
+
+async function synthesizeSpeech(text: string, voiceId: string, apiKey: string): Promise<Uint8Array> {
   const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
     method: "POST",
     headers: {
@@ -73,10 +94,11 @@ Deno.serve(async (req) => {
       .single();
 
     const voiceGender = (project as any)?.voices?.gender || "neutral";
+    const voiceId = await getVoiceId(voiceGender, apiKey);
 
     const scenesWithAudio = [];
     for (const scene of scenes) {
-      const audioBytes = await synthesizeSpeech(scene.narration_line, voiceGender, apiKey);
+      const audioBytes = await synthesizeSpeech(scene.narration_line, voiceId, apiKey);
 
       const path = `${job_id}/scene-${scene.index}.mp3`;
       const { error: uploadError } = await admin.storage
