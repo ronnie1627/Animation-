@@ -71,6 +71,11 @@ function LoginForm() {
         <button type="submit" disabled={loading} className="btn-primary w-full">
           {loading ? "Signing in…" : "Log in"}
         </button>
+        <p className="text-sm text-center">
+          <Link href="/forgot-password" className="text-mist underline hover:text-white">
+            Forgot password?
+          </Link>
+        </p>
         <button type="button" onClick={handleGoogle} className="btn-secondary w-full">
           Continue with Google
         </button>
