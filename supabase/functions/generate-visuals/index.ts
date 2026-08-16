@@ -25,10 +25,12 @@ function seedFromProjectId(projectId: string): number {
 }
 
 function dimensionsForAspectRatio(aspectRatio: string): { width: number; height: number } {
-  // Kept modest on purpose — Pollinations' free tier is slow/unreliable at
-  // very large sizes. The (still-placeholder) upscale-to-4k step is meant
-  // to take these up to final delivery resolution later.
-  return aspectRatio === "9:16" ? { width: 768, height: 1365 } : { width: 1365, height: 768 };
+  // Kept deliberately small — larger images take Pollinations noticeably
+  // longer to generate, and repeated slow requests were exceeding
+  // Supabase's 150s free-tier execution limit. The (still-placeholder)
+  // upscale-to-4k step is meant to take these up to final delivery
+  // resolution later.
+  return aspectRatio === "9:16" ? { width: 512, height: 910 } : { width: 910, height: 512 };
 }
 
 // NOTE: Pollinations has both this legacy endpoint (image.pollinations.ai)
@@ -42,13 +44,20 @@ async function generateSceneImage(
   seed: number,
   width: number,
   height: number,
+  deadlineAt: number,
   attempt = 1
 ): Promise<Uint8Array> {
+  if (Date.now() > deadlineAt) {
+    throw new Error(
+      "Ran out of time generating images before Supabase's execution limit — try a shorter script (fewer scenes) or try again, Pollinations may be under heavy load right now."
+    );
+  }
+
   const prompt = `${styleName} anime style illustration: ${description}, high quality, detailed, vibrant colors`;
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeout = setTimeout(() => controller.abort(), 20000);
 
   try {
     let res: Response;
@@ -58,18 +67,18 @@ async function generateSceneImage(
       // A timeout/abort throws here rather than returning a response — treat
       // it the same as a rate limit: back off and retry rather than failing
       // the whole job over one slow image.
-      if (attempt <= 2) {
-        await new Promise((resolve) => setTimeout(resolve, attempt * 2500));
-        return generateSceneImage(description, styleName, seed, width, height, attempt + 1);
+      if (attempt <= 2 && Date.now() < deadlineAt) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+        return generateSceneImage(description, styleName, seed, width, height, deadlineAt, attempt + 1);
       }
       throw new Error(`Pollinations request timed out after ${attempt} attempts`);
     }
 
-    if (res.status === 429 && attempt <= 2) {
+    if (res.status === 429 && attempt <= 2 && Date.now() < deadlineAt) {
       // Pollinations rate-limits bursts of requests from the same source —
       // back off briefly and retry rather than failing the whole job.
-      await new Promise((resolve) => setTimeout(resolve, attempt * 2500));
-      return generateSceneImage(description, styleName, seed, width, height, attempt + 1);
+      await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+      return generateSceneImage(description, styleName, seed, width, height, deadlineAt, attempt + 1);
     }
 
     if (!res.ok) {
@@ -104,6 +113,11 @@ async function mapWithConcurrencyLimit<T, R>(
 }
 
 Deno.serve(async (req) => {
+  const startTime = Date.now();
+  // Leave a safety margin under Supabase's 150s free-tier hard limit so we
+  // can fail with a clear, logged error instead of being silently killed.
+  const deadlineAt = startTime + 110000;
+
   const { job_id, project_id, scenes } = await req.json();
   const admin = createClient(
     Deno.env.get("SUPABASE_URL")!,
@@ -139,7 +153,7 @@ Deno.serve(async (req) => {
     // the reduced 4-6 scene target from the script-breakdown step, this
     // comfortably fits the time budget.
     const scenesWithVisuals = await mapWithConcurrencyLimit(scenes, 1, async (scene: any) => {
-      const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height);
+      const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height, deadlineAt);
 
       const path = `${job_id}/scene-${scene.index}.jpg`;
       const { error: uploadError } = await admin.storage
