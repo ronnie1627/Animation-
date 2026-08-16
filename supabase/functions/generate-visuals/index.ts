@@ -41,18 +41,25 @@ async function generateSceneImage(
   styleName: string,
   seed: number,
   width: number,
-  height: number
+  height: number,
+  attempt = 1
 ): Promise<Uint8Array> {
   const prompt = `${styleName} anime style illustration: ${description}, high quality, detailed, vibrant colors`;
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
 
-  // A hard per-image timeout so one slow/stuck request can't silently hang
-  // the whole function past Supabase's execution limit.
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 25000);
 
   try {
     const res = await fetch(url, { signal: controller.signal });
+
+    if (res.status === 429 && attempt <= 3) {
+      // Pollinations rate-limits bursts of concurrent requests from the same
+      // source — back off and retry rather than failing the whole job.
+      await new Promise((resolve) => setTimeout(resolve, attempt * 4000));
+      return generateSceneImage(description, styleName, seed, width, height, attempt + 1);
+    }
+
     if (!res.ok) {
       throw new Error(`Pollinations image generation error (${res.status})`);
     }
@@ -60,6 +67,28 @@ async function generateSceneImage(
   } finally {
     clearTimeout(timeout);
   }
+}
+
+// Runs async tasks with a limited number in flight at once, rather than
+// either all-at-once (triggers Pollinations' burst rate limit) or fully
+// sequential (risks exceeding the edge function's execution time limit).
+async function mapWithConcurrencyLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await fn(items[currentIndex]);
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 Deno.serve(async (req) => {
@@ -91,25 +120,22 @@ Deno.serve(async (req) => {
     const seed = seedFromProjectId(project_id);
     const { width, height } = dimensionsForAspectRatio(project.aspect_ratio);
 
-    // Generate every scene's image concurrently rather than one at a time —
-    // generating 5-9 images sequentially can exceed the edge function's
-    // execution time limit and get silently killed. Uploads still happen
-    // per-scene right after each image finishes.
-    const scenesWithVisuals = await Promise.all(
-      scenes.map(async (scene: any) => {
-        const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height);
+    // Generate scene images with limited concurrency (2 at a time) —
+    // fully parallel triggers Pollinations' burst rate limit, while fully
+    // sequential risks exceeding the edge function's execution time limit.
+    const scenesWithVisuals = await mapWithConcurrencyLimit(scenes, 2, async (scene: any) => {
+      const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height);
 
-        const path = `${job_id}/scene-${scene.index}.jpg`;
-        const { error: uploadError } = await admin.storage
-          .from("thumbnails")
-          .upload(path, imageBytes, { contentType: "image/jpeg", upsert: true });
+      const path = `${job_id}/scene-${scene.index}.jpg`;
+      const { error: uploadError } = await admin.storage
+        .from("thumbnails")
+        .upload(path, imageBytes, { contentType: "image/jpeg", upsert: true });
 
-        if (uploadError) throw new Error(`Image upload failed: ${uploadError.message}`);
+      if (uploadError) throw new Error(`Image upload failed: ${uploadError.message}`);
 
-        const { data: publicUrlData } = admin.storage.from("thumbnails").getPublicUrl(path);
-        return { ...scene, visual_url: publicUrlData.publicUrl };
-      })
-    );
+      const { data: publicUrlData } = admin.storage.from("thumbnails").getPublicUrl(path);
+      return { ...scene, visual_url: publicUrlData.publicUrl };
+    });
 
     const firstImageUrl =
       scenesWithVisuals.find((s) => s.index === 0)?.visual_url ?? scenesWithVisuals[0]?.visual_url ?? null;
