@@ -48,10 +48,22 @@ async function generateSceneImage(
   const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), 30000);
 
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    let res: Response;
+    try {
+      res = await fetch(url, { signal: controller.signal });
+    } catch (fetchErr) {
+      // A timeout/abort throws here rather than returning a response — treat
+      // it the same as a rate limit: back off and retry rather than failing
+      // the whole job over one slow image.
+      if (attempt <= 2) {
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2500));
+        return generateSceneImage(description, styleName, seed, width, height, attempt + 1);
+      }
+      throw new Error(`Pollinations request timed out after ${attempt} attempts`);
+    }
 
     if (res.status === 429 && attempt <= 2) {
       // Pollinations rate-limits bursts of requests from the same source —
