@@ -1,13 +1,22 @@
 // Supabase Edge Function: generate-visuals
 // Step 3 of the pipeline: generates a real AI image per scene using
-// Pollinations.ai — a free, keyless image generation API — styled by the
-// project's chosen anime style and scene description, then uploads each
-// image to Supabase Storage.
+// Hugging Face's free Inference API (model: cagliostrolab/animagine-xl-3.1,
+// an SDXL model fine-tuned specifically for anime-style art), then uploads
+// each image to Supabase Storage.
+//
+// Requires the HUGGINGFACE_API_KEY secret:
+//   supabase secrets set HUGGINGFACE_API_KEY=your-token-here
+//
+// ARCHITECTURE NOTE: this function processes ONE scene per invocation and
+// then calls itself again for the next scene, rather than looping over all
+// scenes within a single invocation. This keeps each invocation's time well
+// under Supabase's 150-second free-tier execution limit regardless of how
+// many scenes the video has, and regardless of provider cold-start delays.
 //
 // NOTE: this produces STATIC images per scene, not true motion video. Real
-// motion would require a paid video-generation model (Runway, Kling, etc).
-// The compositing step (next in the pipeline) is expected to apply a
-// pan/zoom ("Ken Burns") effect to these stills to simulate movement.
+// motion would require a paid video-generation model. The compositing step
+// (next in the pipeline) is expected to apply a pan/zoom ("Ken Burns")
+// effect to these stills to simulate movement.
 //
 // NOTE on consistency: a shared seed (derived from the project id) is used
 // across all scenes so the art style stays closer together — but true
@@ -15,6 +24,8 @@
 // fully solve; expect some visual drift between scenes.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
+
+const HF_MODEL = "cagliostrolab/animagine-xl-3.1";
 
 function seedFromProjectId(projectId: string): number {
   let hash = 0;
@@ -24,115 +35,94 @@ function seedFromProjectId(projectId: string): number {
   return hash % 1000000;
 }
 
-function dimensionsForAspectRatio(aspectRatio: string): { width: number; height: number } {
-  // Kept deliberately small — larger images take Pollinations noticeably
-  // longer to generate, and repeated slow requests were exceeding
-  // Supabase's 150s free-tier execution limit. The (still-placeholder)
-  // upscale-to-4k step is meant to take these up to final delivery
-  // resolution later.
-  return aspectRatio === "9:16" ? { width: 512, height: 910 } : { width: 910, height: 512 };
-}
-
-// NOTE: Pollinations has both this legacy endpoint (image.pollinations.ai)
-// and a newer unified one (gen.pollinations.ai/image/...). This one is used
-// here since it's the documented pattern for width/height/seed params; if
-// it's ever retired, check https://github.com/pollinations/pollinations for
-// the current endpoint.
 async function generateSceneImage(
   description: string,
   styleName: string,
   seed: number,
-  width: number,
-  height: number,
-  deadlineAt: number,
+  apiKey: string,
   attempt = 1
 ): Promise<Uint8Array> {
-  if (Date.now() > deadlineAt) {
-    throw new Error(
-      "Ran out of time generating images before Supabase's execution limit — try a shorter script (fewer scenes) or try again, Pollinations may be under heavy load right now."
-    );
-  }
-
-  const prompt = `${styleName} anime style illustration: ${description}, high quality, detailed, vibrant colors`;
-  const url = `https://image.pollinations.ai/prompt/${encodeURIComponent(prompt)}?width=${width}&height=${height}&seed=${seed}&nologo=true`;
+  const prompt = `${styleName} anime style illustration, ${description}, masterpiece, high quality, detailed, vibrant colors`;
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), 45000);
 
   try {
     let res: Response;
     try {
-      res = await fetch(url, { signal: controller.signal });
+      res = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          inputs: prompt,
+          parameters: { seed, negative_prompt: "low quality, blurry, deformed, extra limbs" }
+        })
+      });
     } catch (fetchErr) {
-      // A timeout/abort throws here rather than returning a response — treat
-      // it the same as a rate limit: back off and retry rather than failing
-      // the whole job over one slow image.
-      if (attempt <= 2 && Date.now() < deadlineAt) {
-        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
-        return generateSceneImage(description, styleName, seed, width, height, deadlineAt, attempt + 1);
+      if (attempt <= 2) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
       }
-      throw new Error(`Pollinations request timed out after ${attempt} attempts`);
+      throw new Error(`Hugging Face request timed out after ${attempt} attempts`);
     }
 
-    if (res.status === 429 && attempt <= 2 && Date.now() < deadlineAt) {
-      // Pollinations rate-limits bursts of requests from the same source —
-      // back off briefly and retry rather than failing the whole job.
-      await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
-      return generateSceneImage(description, styleName, seed, width, height, deadlineAt, attempt + 1);
+    // Hugging Face returns 503 with an estimated_time while a model is
+    // "cold" and spinning up for the first request in a while — this is
+    // normal and expected, not a real error. Wait and retry.
+    if (res.status === 503 && attempt <= 4) {
+      let waitMs = 8000;
+      try {
+        const body = await res.json();
+        if (body?.estimated_time) waitMs = Math.min(Math.ceil(body.estimated_time * 1000), 20000);
+      } catch {
+        // ignore parse failure, use default wait
+      }
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
+    }
+
+    if (res.status === 429 && attempt <= 2) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
     }
 
     if (!res.ok) {
-      throw new Error(`Pollinations image generation error (${res.status})`);
+      const errText = await res.text();
+      throw new Error(`Hugging Face API error (${res.status}): ${errText.slice(0, 300)}`);
     }
+
     return new Uint8Array(await res.arrayBuffer());
   } finally {
     clearTimeout(timeout);
   }
 }
 
-// Runs async tasks with a limited number in flight at once, rather than
-// either all-at-once (triggers Pollinations' burst rate limit) or fully
-// sequential (risks exceeding the edge function's execution time limit).
-async function mapWithConcurrencyLimit<T, R>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<R>
-): Promise<R[]> {
-  const results: R[] = new Array(items.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (nextIndex < items.length) {
-      const currentIndex = nextIndex++;
-      results[currentIndex] = await fn(items[currentIndex]);
-    }
-  }
-
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
-}
-
 Deno.serve(async (req) => {
-  const startTime = Date.now();
-  // Leave a safety margin under Supabase's 150s free-tier hard limit so we
-  // can fail with a clear, logged error instead of being silently killed.
-  const deadlineAt = startTime + 110000;
+  const { job_id, project_id, scenes, sceneIndex = 0 } = await req.json();
 
-  const { job_id, project_id, scenes } = await req.json();
   const admin = createClient(
     Deno.env.get("SUPABASE_URL")!,
     Deno.env.get("PROJECT_SERVICE_ROLE_KEY")!
   );
 
   try {
-    await admin
-      .from("generation_jobs")
-      .update({ progress_percent: 60, updated_at: new Date().toISOString() })
-      .eq("id", job_id);
-
     if (!Array.isArray(scenes) || scenes.length === 0) {
       throw new Error("No scenes received from voiceover step");
     }
+
+    if (sceneIndex === 0) {
+      await admin
+        .from("generation_jobs")
+        .update({ progress_percent: 60, updated_at: new Date().toISOString() })
+        .eq("id", job_id);
+    }
+
+    const apiKey = Deno.env.get("HUGGINGFACE_API_KEY");
+    if (!apiKey) throw new Error("HUGGINGFACE_API_KEY secret is not set");
 
     const { data: project } = await admin
       .from("projects")
@@ -144,45 +134,48 @@ Deno.serve(async (req) => {
 
     const styleName = (project as any).styles?.name || "anime";
     const seed = seedFromProjectId(project_id);
-    const { width, height } = dimensionsForAspectRatio(project.aspect_ratio);
 
-    // Generate scene images strictly one at a time. Supabase's free tier
-    // gives each edge function a hard 150-second wall-clock limit — even
-    // 2-at-a-time concurrency triggered Pollinations' burst rate limiter in
-    // testing, so this trades a little speed for reliability. Combined with
-    // the reduced 4-6 scene target from the script-breakdown step, this
-    // comfortably fits the time budget.
-    const scenesWithVisuals = await mapWithConcurrencyLimit(scenes, 1, async (scene: any) => {
-      const imageBytes = await generateSceneImage(scene.description, styleName, seed, width, height, deadlineAt);
+    const currentScene = scenes[sceneIndex];
+    const imageBytes = await generateSceneImage(currentScene.description, styleName, seed, apiKey);
 
-      const path = `${job_id}/scene-${scene.index}.jpg`;
-      const { error: uploadError } = await admin.storage
-        .from("thumbnails")
-        .upload(path, imageBytes, { contentType: "image/jpeg", upsert: true });
+    const path = `${job_id}/scene-${currentScene.index}.jpg`;
+    const { error: uploadError } = await admin.storage
+      .from("thumbnails")
+      .upload(path, imageBytes, { contentType: "image/jpeg", upsert: true });
 
-      if (uploadError) throw new Error(`Image upload failed: ${uploadError.message}`);
+    if (uploadError) throw new Error(`Image upload failed: ${uploadError.message}`);
 
-      const { data: publicUrlData } = admin.storage.from("thumbnails").getPublicUrl(path);
-      return { ...scene, visual_url: publicUrlData.publicUrl };
-    });
+    const { data: publicUrlData } = admin.storage.from("thumbnails").getPublicUrl(path);
+    const updatedScenes = [...scenes];
+    updatedScenes[sceneIndex] = { ...currentScene, visual_url: publicUrlData.publicUrl };
 
-    const firstImageUrl =
-      scenesWithVisuals.find((s) => s.index === 0)?.visual_url ?? scenesWithVisuals[0]?.visual_url ?? null;
+    const sceneProgress = 60 + Math.round(((sceneIndex + 1) / scenes.length) * 15);
+    const updatePayload: Record<string, unknown> = {
+      progress_percent: Math.min(sceneProgress, 75),
+      updated_at: new Date().toISOString()
+    };
+    if (sceneIndex === 0) updatePayload.thumbnail_url = publicUrlData.publicUrl;
 
-    await admin
-      .from("generation_jobs")
-      .update({
-        status: "compositing",
-        progress_percent: 75,
-        thumbnail_url: firstImageUrl,
-        updated_at: new Date().toISOString()
-      })
-      .eq("id", job_id);
+    await admin.from("generation_jobs").update(updatePayload).eq("id", job_id);
 
-    const { error: invokeError } = await admin.functions.invoke("composite-video", {
-      body: { job_id, project_id, scenes: scenesWithVisuals }
-    });
-    if (invokeError) throw invokeError;
+    const isLastScene = sceneIndex >= scenes.length - 1;
+
+    if (!isLastScene) {
+      const { error: invokeError } = await admin.functions.invoke("generate-visuals", {
+        body: { job_id, project_id, scenes: updatedScenes, sceneIndex: sceneIndex + 1 }
+      });
+      if (invokeError) throw invokeError;
+    } else {
+      await admin
+        .from("generation_jobs")
+        .update({ status: "compositing", progress_percent: 75, updated_at: new Date().toISOString() })
+        .eq("id", job_id);
+
+      const { error: invokeError } = await admin.functions.invoke("composite-video", {
+        body: { job_id, project_id, scenes: updatedScenes }
+      });
+      if (invokeError) throw invokeError;
+    }
 
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
@@ -194,7 +187,7 @@ Deno.serve(async (req) => {
       .from("generation_jobs")
       .update({
         status: "failed",
-        error_message: `Visual generation failed: ${(err as Error).message}`,
+        error_message: `Visual generation failed (scene ${sceneIndex + 1}): ${(err as Error).message}`,
         updated_at: new Date().toISOString()
       })
       .eq("id", job_id);
