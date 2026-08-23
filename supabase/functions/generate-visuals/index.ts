@@ -1,8 +1,9 @@
 // Supabase Edge Function: generate-visuals
 // Step 3 of the pipeline: generates a real AI image per scene using
-// Hugging Face's official Inference client (model: black-forest-labs/FLUX.1-schnell,
-// via the "hf-inference" provider included with a free HF account), then
-// uploads each image to Supabase Storage.
+// Hugging Face's official Inference client (model: black-forest-labs/FLUX.1-dev,
+// with provider: "auto" so Hugging Face routes to whichever partner is
+// currently serving the model — their "hf-inference" provider has shifted
+// focus away from image models, so it can't be relied on directly).
 //
 // Requires the HUGGINGFACE_API_KEY secret:
 //   supabase secrets set HUGGINGFACE_API_KEY=your-token-here
@@ -31,7 +32,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 import { InferenceClient } from "https://esm.sh/@huggingface/inference@3.6.1";
 
-const HF_MODEL = "black-forest-labs/FLUX.1-schnell";
+const HF_MODEL = "black-forest-labs/FLUX.1-dev";
 
 function seedFromProjectId(projectId: string): number {
   let hash = 0;
@@ -54,7 +55,7 @@ async function generateSceneImage(
     const imageBlob = await hf.textToImage({
       model: HF_MODEL,
       inputs: prompt,
-      provider: "hf-inference",
+      provider: "auto",
       parameters: { num_inference_steps: 4, seed }
     });
 
