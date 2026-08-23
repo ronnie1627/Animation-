@@ -1,22 +1,27 @@
 // Supabase Edge Function: generate-visuals
 // Step 3 of the pipeline: generates a real AI image per scene using
-// Hugging Face's free Inference API (model: cagliostrolab/animagine-xl-3.1,
-// an SDXL model fine-tuned specifically for anime-style art), then uploads
-// each image to Supabase Storage.
+// Hugging Face's official Inference client (model: black-forest-labs/FLUX.1-schnell,
+// via the "hf-inference" provider included with a free HF account), then
+// uploads each image to Supabase Storage.
 //
 // Requires the HUGGINGFACE_API_KEY secret:
 //   supabase secrets set HUGGINGFACE_API_KEY=your-token-here
 //
+// NOTE: an earlier version of this function called the raw REST endpoint
+// directly (api-inference.huggingface.co/models/...), which turned out to
+// be a legacy path that no longer reliably serves image models. This
+// version uses Hugging Face's own official @huggingface/inference client
+// library instead, which handles the current routing/response format
+// correctly regardless of future provider-routing changes on their end.
+//
 // ARCHITECTURE NOTE: this function processes ONE scene per invocation and
 // then calls itself again for the next scene, rather than looping over all
-// scenes within a single invocation. This keeps each invocation's time well
-// under Supabase's 150-second free-tier execution limit regardless of how
-// many scenes the video has, and regardless of provider cold-start delays.
+// scenes within a single invocation, to stay well under Supabase's
+// 150-second free-tier execution limit regardless of scene count.
 //
-// NOTE: this produces STATIC images per scene, not true motion video. Real
-// motion would require a paid video-generation model. The compositing step
-// (next in the pipeline) is expected to apply a pan/zoom ("Ken Burns")
-// effect to these stills to simulate movement.
+// NOTE: this produces STATIC images per scene, not true motion video. The
+// compositing step (next in the pipeline) is expected to apply a pan/zoom
+// ("Ken Burns") effect to these stills to simulate movement.
 //
 // NOTE on consistency: a shared seed (derived from the project id) is used
 // across all scenes so the art style stays closer together — but true
@@ -24,8 +29,9 @@
 // fully solve; expect some visual drift between scenes.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
+import { InferenceClient } from "https://esm.sh/@huggingface/inference@3.6.1";
 
-const HF_MODEL = "cagliostrolab/animagine-xl-3.1";
+const HF_MODEL = "black-forest-labs/FLUX.1-schnell";
 
 function seedFromProjectId(projectId: string): number {
   let hash = 0;
@@ -39,65 +45,26 @@ async function generateSceneImage(
   description: string,
   styleName: string,
   seed: number,
-  apiKey: string,
+  hf: InferenceClient,
   attempt = 1
 ): Promise<Uint8Array> {
   const prompt = `${styleName} anime style illustration, ${description}, masterpiece, high quality, detailed, vibrant colors`;
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45000);
-
   try {
-    let res: Response;
-    try {
-      res = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          inputs: prompt,
-          parameters: { seed, negative_prompt: "low quality, blurry, deformed, extra limbs" }
-        })
-      });
-    } catch (fetchErr) {
-      if (attempt <= 2) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
-      }
-      throw new Error(`Hugging Face request timed out after ${attempt} attempts`);
-    }
+    const imageBlob = await hf.textToImage({
+      model: HF_MODEL,
+      inputs: prompt,
+      provider: "hf-inference",
+      parameters: { num_inference_steps: 4, seed }
+    });
 
-    // Hugging Face returns 503 with an estimated_time while a model is
-    // "cold" and spinning up for the first request in a while — this is
-    // normal and expected, not a real error. Wait and retry.
-    if (res.status === 503 && attempt <= 4) {
-      let waitMs = 8000;
-      try {
-        const body = await res.json();
-        if (body?.estimated_time) waitMs = Math.min(Math.ceil(body.estimated_time * 1000), 20000);
-      } catch {
-        // ignore parse failure, use default wait
-      }
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-      return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
+    return new Uint8Array(await imageBlob.arrayBuffer());
+  } catch (err) {
+    if (attempt <= 2) {
+      await new Promise((resolve) => setTimeout(resolve, attempt * 3000));
+      return generateSceneImage(description, styleName, seed, hf, attempt + 1);
     }
-
-    if (res.status === 429 && attempt <= 2) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
-    }
-
-    if (!res.ok) {
-      const errText = await res.text();
-      throw new Error(`Hugging Face API error (${res.status}): ${errText.slice(0, 300)}`);
-    }
-
-    return new Uint8Array(await res.arrayBuffer());
-  } finally {
-    clearTimeout(timeout);
+    throw new Error(`Hugging Face image generation failed after ${attempt} attempts: ${(err as Error).message}`);
   }
 }
 
@@ -124,6 +91,8 @@ Deno.serve(async (req) => {
     const apiKey = Deno.env.get("HUGGINGFACE_API_KEY");
     if (!apiKey) throw new Error("HUGGINGFACE_API_KEY secret is not set");
 
+    const hf = new InferenceClient(apiKey);
+
     const { data: project } = await admin
       .from("projects")
       .select("*, styles(name)")
@@ -136,7 +105,7 @@ Deno.serve(async (req) => {
     const seed = seedFromProjectId(project_id);
 
     const currentScene = scenes[sceneIndex];
-    const imageBytes = await generateSceneImage(currentScene.description, styleName, seed, apiKey);
+    const imageBytes = await generateSceneImage(currentScene.description, styleName, seed, hf);
 
     const path = `${job_id}/scene-${currentScene.index}.jpg`;
     const { error: uploadError } = await admin.storage
