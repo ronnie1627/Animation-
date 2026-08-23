@@ -1,9 +1,13 @@
 // Supabase Edge Function: generate-visuals
 // Step 3 of the pipeline: generates a real AI image per scene using
 // Hugging Face's official Inference client (model: black-forest-labs/FLUX.1-dev,
-// with provider: "auto" so Hugging Face routes to whichever partner is
-// currently serving the model — their "hf-inference" provider has shifted
-// focus away from image models, so it can't be relied on directly).
+// explicitly routed through the "fal-ai" provider). Both the default/"auto"
+// routing and the "hf-inference" provider were tried first but both
+// resolved to hf-inference, which no longer hosts image-generation models —
+// fal-ai is the provider Hugging Face's own docs consistently show as
+// actually serving FLUX models, reachable with just a normal HF token
+// (no separate fal.ai account needed; HF routes and bills a small free
+// monthly quota automatically).
 //
 // Requires the HUGGINGFACE_API_KEY secret:
 //   supabase secrets set HUGGINGFACE_API_KEY=your-token-here
@@ -55,6 +59,7 @@ async function generateSceneImage(
     const imageBlob = await hf.textToImage({
       model: HF_MODEL,
       inputs: prompt,
+      provider: "fal-ai",
       parameters: { num_inference_steps: 4, seed }
     });
 
