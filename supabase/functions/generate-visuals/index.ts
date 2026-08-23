@@ -55,7 +55,6 @@ async function generateSceneImage(
     const imageBlob = await hf.textToImage({
       model: HF_MODEL,
       inputs: prompt,
-      provider: "auto",
       parameters: { num_inference_steps: 4, seed }
     });
 
