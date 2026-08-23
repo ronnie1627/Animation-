@@ -1,18 +1,19 @@
 // Supabase Edge Function: generate-visuals
-// Step 3 of the pipeline: generates a real AI image per scene using fal.ai's
-// direct REST API (model: fal-ai/flux/schnell — fast and cheap), then
-// uploads each image to Supabase Storage.
+// Step 3 of the pipeline: generates a real AI image per scene using
+// Cloudflare Workers AI's free tier (10,000 free "neurons"/day, no card
+// required — model: @cf/black-forest-labs/flux-1-schnell), then uploads
+// each image to Supabase Storage.
 //
-// Requires the FAL_API_KEY secret:
-//   supabase secrets set FAL_API_KEY=your-key-here
+// Requires two secrets:
+//   supabase secrets set CLOUDFLARE_API_TOKEN=your-token-here
+//   supabase secrets set CLOUDFLARE_ACCOUNT_ID=your-account-id-here
 //
-// NOTE: earlier versions of this function tried Pollinations (free but had
-// ongoing reliability outages confirmed on their own bug tracker) and
-// Hugging Face's routing layer (worked, but tiny shared free quota and
-// routing kept resolving to providers that don't serve image models). This
-// version calls fal.ai directly — no routing layer, straightforward REST
-// API, and inexpensive even beyond any free credits (~$0.01-0.02/image on
-// the schnell model).
+// NOTE: earlier versions of this function tried Pollinations (ongoing
+// reliability outages), Hugging Face routing (tiny shared free quota,
+// exhausted quickly), and fal.ai directly (requires a funded balance,
+// despite advertising a free tier). Cloudflare Workers AI was chosen next
+// since it's backed by major cloud infrastructure with a genuinely free,
+// no-card daily allowance that explicitly includes image models.
 //
 // ARCHITECTURE NOTE: this function processes ONE scene per invocation and
 // then calls itself again for the next scene, rather than looping over all
@@ -25,12 +26,12 @@
 //
 // NOTE on consistency: a shared seed (derived from the project id) is used
 // across all scenes so the art style stays closer together — but true
-// character consistency across scenes is a hard problem free/cheap tools
-// can't fully solve; expect some visual drift between scenes.
+// character consistency across scenes is a hard problem free tools can't
+// fully solve; expect some visual drift between scenes.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 
-const FAL_MODEL = "fal-ai/flux/schnell";
+const CF_MODEL = "@cf/black-forest-labs/flux-1-schnell";
 
 function seedFromProjectId(projectId: string): number {
   let hash = 0;
@@ -44,7 +45,8 @@ async function generateSceneImage(
   description: string,
   styleName: string,
   seed: number,
-  apiKey: string,
+  accountId: string,
+  apiToken: string,
   attempt = 1
 ): Promise<Uint8Array> {
   const prompt = `${styleName} anime style illustration, ${description}, masterpiece, high quality, detailed, vibrant colors`;
@@ -55,48 +57,50 @@ async function generateSceneImage(
   try {
     let res: Response;
     try {
-      // fal.run is the synchronous endpoint — it blocks until the image is
-      // ready and returns the result directly, no separate polling needed.
-      res = await fetch(`https://fal.run/${FAL_MODEL}`, {
-        method: "POST",
-        headers: {
-          Authorization: `Key ${apiKey}`,
-          "Content-Type": "application/json"
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          prompt,
-          seed,
-          image_size: "portrait_16_9",
-          num_inference_steps: 4
-        })
-      });
+      res = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/run/${CF_MODEL}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiToken}`,
+            "Content-Type": "application/json"
+          },
+          signal: controller.signal,
+          body: JSON.stringify({ prompt, seed, steps: 4 })
+        }
+      );
     } catch (fetchErr) {
       if (attempt <= 2) {
         await new Promise((resolve) => setTimeout(resolve, 3000));
-        return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
+        return generateSceneImage(description, styleName, seed, accountId, apiToken, attempt + 1);
       }
-      throw new Error(`fal.ai request timed out after ${attempt} attempts`);
+      throw new Error(`Cloudflare request timed out after ${attempt} attempts`);
     }
 
     if (res.status === 429 && attempt <= 2) {
       await new Promise((resolve) => setTimeout(resolve, 3000));
-      return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
+      return generateSceneImage(description, styleName, seed, accountId, apiToken, attempt + 1);
     }
 
     if (!res.ok) {
       const errText = await res.text();
-      throw new Error(`fal.ai API error (${res.status}): ${errText.slice(0, 300)}`);
+      throw new Error(`Cloudflare API error (${res.status}): ${errText.slice(0, 300)}`);
     }
 
-    const data = await res.json();
-    const imageUrl = data?.images?.[0]?.url;
-    if (!imageUrl) throw new Error("fal.ai response had no image URL");
+    // Cloudflare returns { result: { image: "<base64 string>" } } for this model.
+    const contentType = res.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const data = await res.json();
+      const base64 = data?.result?.image;
+      if (!base64) throw new Error("Cloudflare response had no image data");
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      return bytes;
+    }
 
-    const imageRes = await fetch(imageUrl);
-    if (!imageRes.ok) throw new Error(`Failed to download generated image (${imageRes.status})`);
-
-    return new Uint8Array(await imageRes.arrayBuffer());
+    // Some Workers AI models return raw image bytes directly instead.
+    return new Uint8Array(await res.arrayBuffer());
   } finally {
     clearTimeout(timeout);
   }
@@ -122,8 +126,10 @@ Deno.serve(async (req) => {
         .eq("id", job_id);
     }
 
-    const apiKey = Deno.env.get("FAL_API_KEY");
-    if (!apiKey) throw new Error("FAL_API_KEY secret is not set");
+    const accountId = Deno.env.get("CLOUDFLARE_ACCOUNT_ID");
+    const apiToken = Deno.env.get("CLOUDFLARE_API_TOKEN");
+    if (!accountId) throw new Error("CLOUDFLARE_ACCOUNT_ID secret is not set");
+    if (!apiToken) throw new Error("CLOUDFLARE_API_TOKEN secret is not set");
 
     const { data: project } = await admin
       .from("projects")
@@ -137,7 +143,13 @@ Deno.serve(async (req) => {
     const seed = seedFromProjectId(project_id);
 
     const currentScene = scenes[sceneIndex];
-    const imageBytes = await generateSceneImage(currentScene.description, styleName, seed, apiKey);
+    const imageBytes = await generateSceneImage(
+      currentScene.description,
+      styleName,
+      seed,
+      accountId,
+      apiToken
+    );
 
     const path = `${job_id}/scene-${currentScene.index}.jpg`;
     const { error: uploadError } = await admin.storage
