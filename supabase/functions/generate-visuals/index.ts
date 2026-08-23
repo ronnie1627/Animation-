@@ -1,23 +1,18 @@
 // Supabase Edge Function: generate-visuals
-// Step 3 of the pipeline: generates a real AI image per scene using
-// Hugging Face's official Inference client (model: black-forest-labs/FLUX.1-dev,
-// explicitly routed through the "fal-ai" provider). Both the default/"auto"
-// routing and the "hf-inference" provider were tried first but both
-// resolved to hf-inference, which no longer hosts image-generation models —
-// fal-ai is the provider Hugging Face's own docs consistently show as
-// actually serving FLUX models, reachable with just a normal HF token
-// (no separate fal.ai account needed; HF routes and bills a small free
-// monthly quota automatically).
+// Step 3 of the pipeline: generates a real AI image per scene using fal.ai's
+// direct REST API (model: fal-ai/flux/schnell — fast and cheap), then
+// uploads each image to Supabase Storage.
 //
-// Requires the HUGGINGFACE_API_KEY secret:
-//   supabase secrets set HUGGINGFACE_API_KEY=your-token-here
+// Requires the FAL_API_KEY secret:
+//   supabase secrets set FAL_API_KEY=your-key-here
 //
-// NOTE: an earlier version of this function called the raw REST endpoint
-// directly (api-inference.huggingface.co/models/...), which turned out to
-// be a legacy path that no longer reliably serves image models. This
-// version uses Hugging Face's own official @huggingface/inference client
-// library instead, which handles the current routing/response format
-// correctly regardless of future provider-routing changes on their end.
+// NOTE: earlier versions of this function tried Pollinations (free but had
+// ongoing reliability outages confirmed on their own bug tracker) and
+// Hugging Face's routing layer (worked, but tiny shared free quota and
+// routing kept resolving to providers that don't serve image models). This
+// version calls fal.ai directly — no routing layer, straightforward REST
+// API, and inexpensive even beyond any free credits (~$0.01-0.02/image on
+// the schnell model).
 //
 // ARCHITECTURE NOTE: this function processes ONE scene per invocation and
 // then calls itself again for the next scene, rather than looping over all
@@ -30,13 +25,12 @@
 //
 // NOTE on consistency: a shared seed (derived from the project id) is used
 // across all scenes so the art style stays closer together — but true
-// character consistency across scenes is a hard problem free tools can't
-// fully solve; expect some visual drift between scenes.
+// character consistency across scenes is a hard problem free/cheap tools
+// can't fully solve; expect some visual drift between scenes.
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
-import { InferenceClient } from "https://esm.sh/@huggingface/inference@3.6.1";
 
-const HF_MODEL = "black-forest-labs/FLUX.1-dev";
+const FAL_MODEL = "fal-ai/flux/schnell";
 
 function seedFromProjectId(projectId: string): number {
   let hash = 0;
@@ -50,26 +44,61 @@ async function generateSceneImage(
   description: string,
   styleName: string,
   seed: number,
-  hf: InferenceClient,
+  apiKey: string,
   attempt = 1
 ): Promise<Uint8Array> {
   const prompt = `${styleName} anime style illustration, ${description}, masterpiece, high quality, detailed, vibrant colors`;
 
-  try {
-    const imageBlob = await hf.textToImage({
-      model: HF_MODEL,
-      inputs: prompt,
-      provider: "fal-ai",
-      parameters: { num_inference_steps: 4, seed }
-    });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 45000);
 
-    return new Uint8Array(await imageBlob.arrayBuffer());
-  } catch (err) {
-    if (attempt <= 2) {
-      await new Promise((resolve) => setTimeout(resolve, attempt * 3000));
-      return generateSceneImage(description, styleName, seed, hf, attempt + 1);
+  try {
+    let res: Response;
+    try {
+      // fal.run is the synchronous endpoint — it blocks until the image is
+      // ready and returns the result directly, no separate polling needed.
+      res = await fetch(`https://fal.run/${FAL_MODEL}`, {
+        method: "POST",
+        headers: {
+          Authorization: `Key ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          prompt,
+          seed,
+          image_size: "portrait_16_9",
+          num_inference_steps: 4
+        })
+      });
+    } catch (fetchErr) {
+      if (attempt <= 2) {
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+        return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
+      }
+      throw new Error(`fal.ai request timed out after ${attempt} attempts`);
     }
-    throw new Error(`Hugging Face image generation failed after ${attempt} attempts: ${(err as Error).message}`);
+
+    if (res.status === 429 && attempt <= 2) {
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+      return generateSceneImage(description, styleName, seed, apiKey, attempt + 1);
+    }
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`fal.ai API error (${res.status}): ${errText.slice(0, 300)}`);
+    }
+
+    const data = await res.json();
+    const imageUrl = data?.images?.[0]?.url;
+    if (!imageUrl) throw new Error("fal.ai response had no image URL");
+
+    const imageRes = await fetch(imageUrl);
+    if (!imageRes.ok) throw new Error(`Failed to download generated image (${imageRes.status})`);
+
+    return new Uint8Array(await imageRes.arrayBuffer());
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -93,10 +122,8 @@ Deno.serve(async (req) => {
         .eq("id", job_id);
     }
 
-    const apiKey = Deno.env.get("HUGGINGFACE_API_KEY");
-    if (!apiKey) throw new Error("HUGGINGFACE_API_KEY secret is not set");
-
-    const hf = new InferenceClient(apiKey);
+    const apiKey = Deno.env.get("FAL_API_KEY");
+    if (!apiKey) throw new Error("FAL_API_KEY secret is not set");
 
     const { data: project } = await admin
       .from("projects")
@@ -110,7 +137,7 @@ Deno.serve(async (req) => {
     const seed = seedFromProjectId(project_id);
 
     const currentScene = scenes[sceneIndex];
-    const imageBytes = await generateSceneImage(currentScene.description, styleName, seed, hf);
+    const imageBytes = await generateSceneImage(currentScene.description, styleName, seed, apiKey);
 
     const path = `${job_id}/scene-${currentScene.index}.jpg`;
     const { error: uploadError } = await admin.storage
