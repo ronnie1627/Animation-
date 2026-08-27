@@ -66,7 +66,7 @@ async function generateSceneImage(
             "Content-Type": "application/json"
           },
           signal: controller.signal,
-          body: JSON.stringify({ prompt, seed, steps: 4 })
+          body: JSON.stringify({ prompt, steps: 4 })
         }
       );
     } catch (fetchErr) {
