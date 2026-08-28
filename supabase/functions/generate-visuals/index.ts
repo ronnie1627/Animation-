@@ -179,15 +179,20 @@ Deno.serve(async (req) => {
       });
       if (invokeError) throw invokeError;
     } else {
+      // All scenes have real images + audio now. The final assembly
+      // (pan/zoom motion, subtitles, muxing audio, exporting an mp4) happens
+      // in the browser via ffmpeg.wasm — Supabase edge functions can't run
+      // real video encoding. Save the full scene list so the Studio page
+      // can pick it up and run that step itself.
       await admin
         .from("generation_jobs")
-        .update({ status: "compositing", progress_percent: 75, updated_at: new Date().toISOString() })
+        .update({
+          status: "compositing",
+          progress_percent: 75,
+          scenes_data: updatedScenes,
+          updated_at: new Date().toISOString()
+        })
         .eq("id", job_id);
-
-      const { error: invokeError } = await admin.functions.invoke("composite-video", {
-        body: { job_id, project_id, scenes: updatedScenes }
-      });
-      if (invokeError) throw invokeError;
     }
 
     return new Response(JSON.stringify({ ok: true }), {

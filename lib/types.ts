@@ -53,6 +53,7 @@ export type GenerationJob = {
   video_url_4k: string | null;
   thumbnail_url: string | null;
   duration_seconds: number | null;
+  scenes_data: unknown | null;
   created_at: string;
   updated_at: string;
 };

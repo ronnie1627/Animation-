@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import SelectGrid from "@/components/SelectGrid";
 import ProgressPanel from "@/components/ProgressPanel";
+import { compositeVideo } from "@/lib/compositeVideo";
 import type { GenerationJob, Profile, Style, Template, Voice } from "@/lib/types";
 
 const SUBTITLE_FORMATS = [
@@ -35,6 +36,8 @@ export default function StudioPage() {
   const [job, setJob] = useState<GenerationJob | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [compositing, setCompositing] = useState<{ percent: number; label: string } | null>(null);
+  const compositingStartedRef = useRef<Set<string>>(new Set());
 
   const wordCount = script.trim() ? script.trim().split(/\s+/).length : 0;
   const estSeconds = Math.round((wordCount / 150) * 60); // ~150 wpm narration estimate
@@ -97,6 +100,54 @@ export default function StudioPage() {
       supabase.removeChannel(channel);
     };
   }, [job, supabase]);
+
+  useEffect(() => {
+    if (!job || job.status !== "compositing") return;
+    if (compositingStartedRef.current.has(job.id)) return;
+    const scenesData = (job as any).scenes_data;
+    if (!scenesData || !Array.isArray(scenesData) || scenesData.length === 0) return;
+
+    compositingStartedRef.current.add(job.id);
+
+    (async () => {
+      try {
+        const blob = await compositeVideo(scenesData, {
+          aspectRatio,
+          subtitlesEnabled,
+          onProgress: (percent, label) => setCompositing({ percent, label })
+        });
+
+        setCompositing({ percent: 97, label: "Uploading final video…" });
+
+        const path = `${job.id}/final.mp4`;
+        const { error: uploadError } = await supabase.storage
+          .from("video-exports")
+          .upload(path, blob, { contentType: "video/mp4", upsert: true });
+
+        if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
+
+        const totalDuration = scenesData.reduce(
+          (sum: number, s: any) => sum + (s.duration_estimate_seconds || 6),
+          0
+        );
+
+        const { error: finalizeError } = await supabase.functions.invoke("finalize-video", {
+          body: { job_id: job.id, video_path: path, duration_seconds: Math.round(totalDuration) }
+        });
+
+        if (finalizeError) throw new Error(finalizeError.message);
+
+        setCompositing(null);
+      } catch (err) {
+        console.error(err);
+        setCompositing(null);
+        setError(
+          `Video assembly failed in your browser: ${(err as Error).message}. Try again — this step runs on your device and can be sensitive to browser/tab conditions.`
+        );
+      }
+    })();
+  }, [job, aspectRatio, subtitlesEnabled, supabase]);
+
 
   const costCredits = resolution === "4k" ? 3 : 1;
   const canAfford = profile ? profile.is_admin || profile.credits >= costCredits : false;
@@ -290,36 +341,40 @@ export default function StudioPage() {
           {job && (
             <section className="space-y-4">
               <ProgressPanel job={job} />
+              {compositing && (
+                <div className="glass p-6 space-y-3">
+                  <p className="text-sm font-semibold">Assembling video on your device…</p>
+                  <div className="w-full h-2 rounded-full bg-line overflow-hidden">
+                    <div
+                      className="h-full bg-aurora transition-all duration-300"
+                      style={{ width: `${compositing.percent}%` }}
+                    />
+                  </div>
+                  <p className="text-xs text-mist">{compositing.label}</p>
+                  <p className="text-xs text-mist">
+                    This runs in your browser and may take a minute or two — keep this tab open.
+                  </p>
+                </div>
+              )}
               {job.status === "complete" && (
                 <div className="glass p-4 space-y-3">
-                  {job.video_url_4k || job.video_url_1080p ? (
-                    <>
-                      <video
-                        src={job.video_url_4k || job.video_url_1080p || undefined}
-                        controls
-                        className="w-full rounded-lg"
-                      />
-                      <div className="flex gap-2">
-                        {job.video_url_1080p && (
-                          <a href={job.video_url_1080p} download className="btn-secondary flex-1 text-sm text-center">
-                            Download 1080p
-                          </a>
-                        )}
-                        {job.video_url_4k && (
-                          <a href={job.video_url_4k} download className="btn-primary flex-1 text-sm text-center">
-                            Download 4K
-                          </a>
-                        )}
-                      </div>
-                    </>
-                  ) : (
-                    <div className="p-4 text-center space-y-2">
-                      <p className="font-semibold text-amber-400 text-sm">Generation Completed (No Video URL)</p>
-                      <p className="text-xs text-mist">
-                        The pipeline completed, but no video file URL was set. Ensure your backend Edge Functions return a valid video output.
-                      </p>
-                    </div>
-                  )}
+                  <video
+                    src={job.video_url_4k || job.video_url_1080p || undefined}
+                    controls
+                    className="w-full rounded-lg"
+                  />
+                  <div className="flex gap-2">
+                    {job.video_url_1080p && (
+                      <a href={job.video_url_1080p} download className="btn-secondary flex-1 text-sm">
+                        Download 1080p
+                      </a>
+                    )}
+                    {job.video_url_4k && (
+                      <a href={job.video_url_4k} download className="btn-primary flex-1 text-sm">
+                        Download 4K
+                      </a>
+                    )}
+                  </div>
                 </div>
               )}
             </section>
