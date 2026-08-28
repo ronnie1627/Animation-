@@ -25,15 +25,13 @@ export type CompositeOptions = {
   onProgress?: (percent: number, label: string) => void;
 };
 
-const FFMPEG_CORE_VERSION = "0.12.6";
+const FFMPEG_CORE_VERSION = "0.12.10";
 
 function escapeForDrawtext(text: string): string {
-  // ffmpeg's drawtext filter treats these characters specially inside its
-  // own mini-syntax, so they need escaping or the filter graph breaks.
   return text
     .replace(/\\/g, "\\\\")
     .replace(/:/g, "\\:")
-    .replace(/'/g, "\u2019") // swap apostrophes for a safe lookalike char
+    .replace(/'/g, "\u2019")
     .replace(/%/g, "\\%");
 }
 
@@ -47,7 +45,9 @@ export async function compositeVideo(
   const ffmpeg = new FFmpeg();
 
   report(2, "Loading video engine…");
-  const baseURL = `https://unpkg.com/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
+  // jsdelivr is used rather than unpkg — unpkg has a well-documented history
+  // of intermittently 404ing on these specific ffmpeg-core asset files.
+  const baseURL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
   await ffmpeg.load({
     coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
     wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm")
@@ -56,8 +56,6 @@ export async function compositeVideo(
   const [width, height] = aspectRatio === "9:16" ? [720, 1280] : [1280, 720];
   const fps = 24;
 
-  // Download every scene's image + audio and write them into ffmpeg's
-  // virtual filesystem.
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     report(5 + Math.round((i / scenes.length) * 25), `Downloading scene ${i + 1} assets…`);
@@ -73,8 +71,6 @@ export async function compositeVideo(
     const scene = scenes[i];
     report(30 + Math.round((i / scenes.length) * 45), `Rendering scene ${i + 1} of ${scenes.length}…`);
 
-    // A little buffer beyond the estimated duration so -shortest trims to
-    // the real audio length rather than the video cutting audio short.
     const clipDuration = Math.max(scene.duration_estimate_seconds + 1.5, 3);
     const totalFrames = Math.round(clipDuration * fps);
 
