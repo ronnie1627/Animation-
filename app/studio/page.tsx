@@ -40,15 +40,13 @@ export default function StudioPage() {
   const compositingStartedRef = useRef<Set<string>>(new Set());
 
   const wordCount = script.trim() ? script.trim().split(/\s+/).length : 0;
-  const estSeconds = Math.round((wordCount / 150) * 60); // ~150 wpm narration estimate
+  const estSeconds = Math.round((wordCount / 150) * 60);
 
   const selectedTemplate = useMemo(
     () => templates.find((t) => t.id === templateId),
     [templates, templateId]
   );
 
-  // Load real styles/templates/voices from the database (their IDs are
-  // generated UUIDs — they must be used as-is, never hardcoded).
   useEffect(() => {
     async function loadCatalog() {
       const [{ data: s }, { data: t }, { data: v }] = await Promise.all([
@@ -84,8 +82,13 @@ export default function StudioPage() {
     });
   }, [supabase]);
 
+  // Watches the active job's status via Supabase Realtime, with a direct
+  // polling fallback every 4s in case a realtime event is ever missed
+  // (e.g. during a brief reconnect) — keyed off job?.id only so it doesn't
+  // tear down and rebuild the subscription on every single update, which
+  // previously created a race condition that could leave the UI stuck.
   useEffect(() => {
-    if (!job || job.status === "complete" || job.status === "failed") return;
+    if (!job?.id) return;
 
     const channel = supabase
       .channel(`job-${job.id}`)
@@ -96,11 +99,20 @@ export default function StudioPage() {
       )
       .subscribe();
 
+    const pollInterval = setInterval(async () => {
+      const { data } = await supabase.from("generation_jobs").select("*").eq("id", job.id).single();
+      if (data && data.updated_at !== job.updated_at) setJob(data as GenerationJob);
+    }, 4000);
+
     return () => {
       supabase.removeChannel(channel);
+      clearInterval(pollInterval);
     };
-  }, [job, supabase]);
+  }, [job?.id, supabase]);
 
+  // Once the job reaches "compositing" and has scene data attached, run the
+  // actual video assembly in the browser (ffmpeg.wasm) — this can't happen
+  // on the server since Supabase edge functions can't do real video encoding.
   useEffect(() => {
     if (!job || job.status !== "compositing") return;
     if (compositingStartedRef.current.has(job.id)) return;
@@ -147,7 +159,6 @@ export default function StudioPage() {
       }
     })();
   }, [job, aspectRatio, subtitlesEnabled, supabase]);
-
 
   const costCredits = resolution === "4k" ? 3 : 1;
   const canAfford = profile ? profile.is_admin || profile.credits >= costCredits : false;
