@@ -1,13 +1,5 @@
 "use client";
 
-// Client-side video compositor using ffmpeg.wasm. Runs entirely in the
-// browser since Supabase edge functions can't do real video encoding.
-//
-// For each scene: downloads its AI-generated image + narration audio,
-// applies a pan/zoom ("Ken Burns") effect sized to the audio's duration,
-// and burns in the narration line as a subtitle. All scene clips are then
-// concatenated into the final video.
-
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
@@ -28,11 +20,18 @@ export type CompositeOptions = {
 const FFMPEG_CORE_VERSION = "0.12.10";
 
 function escapeForDrawtext(text: string): string {
-  return text
-    .replace(/\\/g, "\\\\")
-    .replace(/:/g, "\\:")
-    .replace(/'/g, "\u2019")
-    .replace(/%/g, "\\%");
+  return text.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\u2019").replace(/%/g, "\\%");
+}
+
+// Wraps a promise with a hard timeout so a silent hang (no thrown error)
+// surfaces as a real, visible failure instead of spinning forever.
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+    )
+  ]);
 }
 
 export async function compositeVideo(
@@ -42,16 +41,34 @@ export async function compositeVideo(
   const { aspectRatio, subtitlesEnabled, onProgress } = options;
   const report = (percent: number, label: string) => onProgress?.(percent, label);
 
+  console.log("[compositeVideo] starting, scenes:", scenes.length);
+
   const ffmpeg = new FFmpeg();
 
-  report(2, "Loading video engine…");
-  // jsdelivr is used rather than unpkg — unpkg has a well-documented history
-  // of intermittently 404ing on these specific ffmpeg-core asset files.
-  const baseURL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm")
+  ffmpeg.on("log", ({ message }) => {
+    console.log("[ffmpeg]", message);
   });
+
+  report(2, "Loading video engine…");
+  const baseURL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
+
+  console.log("[compositeVideo] fetching core JS…");
+  const coreURL = await withTimeout(
+    toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
+    30000,
+    "Fetching ffmpeg-core.js"
+  );
+  console.log("[compositeVideo] core JS fetched, fetching wasm…");
+
+  const wasmURL = await withTimeout(
+    toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
+    30000,
+    "Fetching ffmpeg-core.wasm"
+  );
+  console.log("[compositeVideo] wasm fetched, calling ffmpeg.load()…");
+
+  await withTimeout(ffmpeg.load({ coreURL, wasmURL }), 30000, "ffmpeg.load()");
+  console.log("[compositeVideo] ffmpeg.load() resolved successfully");
 
   const [width, height] = aspectRatio === "9:16" ? [720, 1280] : [1280, 720];
   const fps = 24;
@@ -59,6 +76,7 @@ export async function compositeVideo(
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     report(5 + Math.round((i / scenes.length) * 25), `Downloading scene ${i + 1} assets…`);
+    console.log(`[compositeVideo] downloading scene ${i} assets`);
     const imageData = await fetchFile(scene.visual_url);
     const audioData = await fetchFile(scene.audio_url);
     await ffmpeg.writeFile(`img${i}.jpg`, imageData);
@@ -70,6 +88,7 @@ export async function compositeVideo(
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     report(30 + Math.round((i / scenes.length) * 45), `Rendering scene ${i + 1} of ${scenes.length}…`);
+    console.log(`[compositeVideo] rendering scene ${i}`);
 
     const clipDuration = Math.max(scene.duration_estimate_seconds + 1.5, 3);
     const totalFrames = Math.round(clipDuration * fps);
@@ -85,51 +104,29 @@ export async function compositeVideo(
     const outputFile = `scene_${i}.mp4`;
 
     await ffmpeg.exec([
-      "-loop",
-      "1",
-      "-i",
-      `img${i}.jpg`,
-      "-i",
-      `audio${i}.mp3`,
-      "-vf",
-      `${zoompanFilter}${subtitleFilter},format=yuv420p`,
-      "-c:v",
-      "libx264",
-      "-preset",
-      "ultrafast",
-      "-c:a",
-      "aac",
-      "-shortest",
-      "-r",
-      String(fps),
-      outputFile
+      "-loop", "1", "-i", `img${i}.jpg`, "-i", `audio${i}.mp3`,
+      "-vf", `${zoompanFilter}${subtitleFilter},format=yuv420p`,
+      "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+      "-shortest", "-r", String(fps), outputFile
     ]);
 
     sceneOutputFiles.push(outputFile);
   }
 
   report(80, "Combining scenes…");
+  console.log("[compositeVideo] concatenating scenes");
 
   const concatListContent = sceneOutputFiles.map((f) => `file '${f}'`).join("\n");
   await ffmpeg.writeFile("concat_list.txt", concatListContent);
 
-  await ffmpeg.exec([
-    "-f",
-    "concat",
-    "-safe",
-    "0",
-    "-i",
-    "concat_list.txt",
-    "-c",
-    "copy",
-    "final_output.mp4"
-  ]);
+  await ffmpeg.exec(["-f", "concat", "-safe", "0", "-i", "concat_list.txt", "-c", "copy", "final_output.mp4"]);
 
   report(95, "Finishing up…");
 
   const outputData = await ffmpeg.readFile("final_output.mp4");
   const blob = new Blob([new Uint8Array(outputData as Uint8Array)], { type: "video/mp4" });
 
+  console.log("[compositeVideo] done, blob size:", blob.size);
   report(100, "Done");
 
   return blob;
