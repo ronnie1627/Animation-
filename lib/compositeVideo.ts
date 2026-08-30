@@ -1,6 +1,14 @@
 "use client";
 
-import { FFmpeg } from "@ffmpeg/ffmpeg";
+// NOTE: this loads ffmpeg.wasm via a <script> tag pointing at its UMD build
+// on jsdelivr, rather than importing the @ffmpeg/ffmpeg npm package
+// directly. The npm package's internal worker creation
+// (`new Worker(new URL(...), { type: "module" })`) has a long-standing,
+// still-unresolved compatibility conflict with Next.js's webpack bundler
+// (see ffmpegwasm/ffmpeg.wasm issues #793, #678, #815 — ffmpeg.load()
+// hangs indefinitely with no error). Loading the UMD build as a global
+// script avoids that bundling path entirely.
+
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
 export type SceneAsset = {
@@ -17,14 +25,13 @@ export type CompositeOptions = {
   onProgress?: (percent: number, label: string) => void;
 };
 
+const FFMPEG_VERSION = "0.12.10";
 const FFMPEG_CORE_VERSION = "0.12.10";
 
 function escapeForDrawtext(text: string): string {
   return text.replace(/\\/g, "\\\\").replace(/:/g, "\\:").replace(/'/g, "\u2019").replace(/%/g, "\\%");
 }
 
-// Wraps a promise with a hard timeout so a silent hang (no thrown error)
-// surfaces as a real, visible failure instead of spinning forever.
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     promise,
@@ -32,6 +39,26 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
       setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
     )
   ]);
+}
+
+let umdScriptLoadPromise: Promise<void> | null = null;
+
+function loadFFmpegUMDScript(): Promise<void> {
+  if (umdScriptLoadPromise) return umdScriptLoadPromise;
+
+  umdScriptLoadPromise = new Promise((resolve, reject) => {
+    if ((window as any).FFmpegWASM) {
+      resolve();
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = `https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/umd/ffmpeg.js`;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("Failed to load ffmpeg.wasm UMD script from CDN"));
+    document.head.appendChild(script);
+  });
+
+  return umdScriptLoadPromise;
 }
 
 export async function compositeVideo(
@@ -43,14 +70,18 @@ export async function compositeVideo(
 
   console.log("[compositeVideo] starting, scenes:", scenes.length);
 
+  report(2, "Loading video engine…");
+  await withTimeout(loadFFmpegUMDScript(), 20000, "Loading ffmpeg.wasm script");
+  console.log("[compositeVideo] UMD script loaded, FFmpegWASM global:", !!(window as any).FFmpegWASM);
+
+  const { FFmpeg } = (window as any).FFmpegWASM;
   const ffmpeg = new FFmpeg();
 
-  ffmpeg.on("log", ({ message }) => {
+  ffmpeg.on("log", ({ message }: { message: string }) => {
     console.log("[ffmpeg]", message);
   });
 
-  report(2, "Loading video engine…");
-  const baseURL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/esm`;
+  const baseURL = `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${FFMPEG_CORE_VERSION}/dist/umd`;
 
   console.log("[compositeVideo] fetching core JS…");
   const coreURL = await withTimeout(
